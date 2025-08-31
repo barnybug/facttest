@@ -19,32 +19,61 @@ def sign(i):
     return 1 if i > 0 else -1 if i < 0 else 0
 
 
+BELT_LIMIT = {
+    "transport-belt": 15,
+    "fast-transport-belt": 30,
+    "express-transport-belt": 45,
+}
+INSERTER_LIMIT = [
+    # TODO: actually determine these for various stack upgrades
+    # normal, fast
+    (frac("1.7"), 7),
+]
+INSERTER_LEVEL = 0
+BELT_COLOURS = {
+    "transport-belt": "yellow",
+    "fast-transport-belt": "red",
+    "express-transport-belt": "blue",
+}
+INSERTER_COLOURS = {
+    "inserter": "yellow",
+    "long-hand-inserter": "red",
+    "fast-inserter": "blue",
+    "bulk-inserter": "green",
+}
+
+
 def belt_required(rate):
-    if rate <= 15:
-        return "transport-belt"
-    if rate <= 30:
-        return "fast-transport-belt"
-    if rate <= 45:
-        return "express-transport-belt"
-    assert rate > 45, "rate exceeds single belt"
+    for belt, limit in BELT_LIMIT.items():
+        if rate <= limit:
+            return belt
+    assert False, "rate exceeds single belt"
 
 
 def belts_required(rate):
-    if rate <= 15:
-        return (1, "transport-belt")
-    if rate <= 30:
-        return (1, "fast-transport-belt")
+    for belt, limit in BELT_LIMIT.items():
+        if rate <= limit:
+            return (1, belt)
     n = round(rate / 45)  # round up
     return (n, "express-transport-belt")
 
 
 def inserter_required(rate):
-    # TODO: actually determine these for stack upgrades
-    if rate > frac("1.7"):
+    normal, fast = INSERTER_LIMIT[INSERTER_LEVEL]
+    if rate < normal:
+        return "inserter"
+    if rate < fast:
         return "fast-inserter"
-    if rate > 7:
-        return "stack-inserter"
-    return "inserter"
+    return "bulk-inserter"
+
+
+def inserter_colour(i: str, text: str):
+    return f"[{INSERTER_COLOURS[i]}]{text}[/]"
+
+
+def belt_colour(rate):
+    belt = belt_required(rate)
+    return f"[{BELT_COLOURS[belt]}]{rate:.2f}/s[/]"
 
 
 class Route:
@@ -215,28 +244,6 @@ def lane_y(i: int):
     return i * 2 - i % 2
 
 
-BELT_COLOURS = {
-    "transport-belt": "yellow",
-    "fast-transport-belt": "red",
-    "express-transport-belt": "blue",
-}
-INSERTER_COLOURS = {
-    "inserter": "yellow",
-    "long-hand-inserter": "red",
-    "fast-inserter": "blue",
-    "stack-inserter": "green",
-}
-
-
-def inserter_colour(i: str, text: str):
-    return f"[{INSERTER_COLOURS[i]}]{text}[/]"
-
-
-def belt_colour(rate):
-    belt = belt_required(rate)
-    return f"[{BELT_COLOURS[belt]}]{rate:.2f}/s[/]"
-
-
 class LayoutEngine:
     vpad = 3
 
@@ -323,16 +330,22 @@ class LayoutEngine:
         column_width = (
             left_belts + 1 + mul.machine.width + 1 + (3 if right_belts > 1 else 1)
         )  # Add extra space for the 3rd belt tap
-        column_height = self.vpad
-
-        left = origin[left_belts + 1, -column_height - mul.machine.height + 1]
+        left = origin[left_belts + 1, -self.vpad + 1]
 
         start_entity_index = len(origin.blueprint.entities)
 
-        input_inserters = [inserter_required(div(mul.flow(item).rateIn, mul.num)) for item in mul.inputs]
+        input_items = list(mul.inputs)
+        input_inserters = [inserter_required(div(mul.flow(item).rateIn, mul.num)) for item in input_items]
 
         # Machines, etc
+        half = mul.num // 2
         for j in range(mul.num):
+            if mul.num > 1 and j == half:
+                # Make space for right-left balancer.
+                left = left[0, -3]
+                left[1, 0].electric_pole()
+
+            left = left[0, -mul.machine.height]
             left.place(
                 mul.machine.name,
                 N,
@@ -340,9 +353,11 @@ class LayoutEngine:
             )
 
             # Input inserter(s)
-            left[-1, 1].place(input_inserters[0], W)
             if input_belts > 1:
+                left[-1, 1].place(input_inserters[1], W)
                 left[-1, 2].long_inserter(W)
+            else:
+                left[-1, 1].place(input_inserters[0], W)
 
             right = left[mul.machine.width, 0]
             if input_belts > 2:
@@ -357,18 +372,15 @@ class LayoutEngine:
                 left[-1, 0].electric_pole()
                 right[0, 0].electric_pole()
 
-            column_height += mul.machine.height
-            left = left[0, -mul.machine.height]
+        left = left[0, -mul.machine.height]
+        column_height = -(left.origin.y + 2)
 
         # Inputs
         right = left_belts + 1 + mul.machine.width + 1
-        # TODO: Use nearest lanes for 'big' inputs, faster inserters (copper wire?)
 
         active_lanes = {i for i, lane in enumerate(bus) if lane.item in mul.inputs}
 
-        for i, input_item in enumerate(mul.inputs):
-            x = i if i < left_belts else right + i - 1
-
+        for i, input_item in enumerate(input_items):
             # Find lane
             j, lane = next((i, lane) for i, lane in enumerate(bus) if lane.item == input_item)
 
@@ -377,15 +389,16 @@ class LayoutEngine:
             remain = lane.rate - consumed
             fully_consumed = remain == 0
 
+            inserter_type = input_inserters[i]
             per_machine = div(consumed, mul.num)
-
             logger.info(
                 "↠ %s total: %s, per machine: %s",
                 input_item,
                 belt_colour(consumed),
-                inserter_colour(inserter_required(per_machine), "%.2f/s" % (per_machine,)),
+                inserter_colour(inserter_type, "%.2f/s" % (per_machine,)),
             )
 
+            x = i if i < left_belts else right + i - 1
             s = origin[x, lane.route.end.y]
             end = origin[x, -column_height + 1]
             if fully_consumed:
@@ -445,7 +458,8 @@ class LayoutEngine:
             bus[j] = lane._replace(rate=remain, route=new_bus_route)
 
         logger.info(
-            "↞ total: %s, per machine: %s",
+            "↞ %s: total %s, per machine: %s",
+            output_item,
             belt_colour(output_rate),
             inserter_colour(output_inserter, "%.2f/s" % (output_per_machine,)),
         )

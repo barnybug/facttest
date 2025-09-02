@@ -3,12 +3,12 @@ import time
 from typing import NamedTuple
 
 import pyperclip
-from draftsman.blueprintable import Blueprint
+from draftsman.blueprintable import Blueprint, Group
 from draftsman.classes.entity import Entity
 from draftsman.classes.vector import Vector
 from draftsman.constants import Direction
 from factoriocalc import Box, config, itm, presets, produce, rcp, setGameConfig
-from factoriocalc.fracs import Frac, div, frac
+from factoriocalc.fracs import Frac, ceil, div, frac
 from rich.highlighter import NullHighlighter
 from rich.logging import RichHandler
 
@@ -24,10 +24,11 @@ BELT_LIMIT = {
     "fast-transport-belt": 30,
     "express-transport-belt": 45,
 }
+INSERTERS = ["inserter", "fast-inserter", "bulk-inserter"]
 INSERTER_LIMIT = [
     # TODO: actually determine these for various stack upgrades
     # normal, fast
-    (frac("1.7"), 7),
+    (frac("1.7"), 7, 10),
 ]
 INSERTER_LEVEL = 0
 BELT_COLOURS = {
@@ -54,17 +55,19 @@ def belts_required(rate):
     for belt, limit in BELT_LIMIT.items():
         if rate <= limit:
             return (1, belt)
-    n = round(rate / 45)  # round up
+    n = ceil(div(rate, 45))  # round up
     return (n, "express-transport-belt")
 
 
+class InserterLimit(Exception):
+    pass
+
+
 def inserter_required(rate):
-    normal, fast = INSERTER_LIMIT[INSERTER_LEVEL]
-    if rate < normal:
-        return "inserter"
-    if rate < fast:
-        return "fast-inserter"
-    return "bulk-inserter"
+    for inserter, limit in zip(INSERTERS, INSERTER_LIMIT[INSERTER_LEVEL]):
+        if rate <= limit:
+            return inserter
+    raise InserterLimit()
 
 
 def inserter_colour(i: str, text: str):
@@ -74,6 +77,10 @@ def inserter_colour(i: str, text: str):
 def belt_colour(rate):
     belt = belt_required(rate)
     return f"[{BELT_COLOURS[belt]}]{rate:.2f}/s[/]"
+
+
+def belt_load(rate, belt):
+    return div(rate, BELT_LIMIT[belt])
 
 
 class Route:
@@ -136,9 +143,6 @@ class Placer:
     def long_inserter(self, *args, **kwargs):
         return self.place("long-handed-inserter", *args, **kwargs)
 
-    # def belt(self, name: str, *args, **kwargs):
-    #     return self.place(name: str, *args, **kwargs)
-
     def electric_pole(self, *args, **kwargs):
         return self.place("small-electric-pole", *args, **kwargs)
 
@@ -147,16 +151,6 @@ class Placer:
         route = Route(self.origin, belt)
         self.routes.append(route)
         return route
-
-    # def route_to(self, b, belt="transport-belt"):
-    #     return self.route(b.x - self.x, b.y - self.y, belt)
-
-    # def route(self, x, y, belt="transport-belt"):
-    #     if x and y:
-    #         raise ValueError("Diagonals unsupported")
-    #     # All routing is performed at end together as complex.
-    #     self.routes.append((self.origin, x, y, belt))
-    #     return self[x, y]
 
     def render_routes(self):
         segments = []
@@ -253,7 +247,14 @@ class LayoutEngine:
         ordered = self.order(factory)
         origin = Placer(blueprint, Vector(0, 0), [])
         bus = []
-        for i, item in enumerate(factory.inputs):
+
+        # sort iron, copper, coal, stone
+        preferred_input_order = {
+            item: i for i, item in enumerate([itm.iron_plate, itm.copper_plate, itm.coal, itm.stone])
+        }
+        factory_inputs = sorted(factory.inputs, key=lambda item: preferred_input_order.get(item, 99))
+
+        for i, item in enumerate(factory_inputs):
             # Calculate lane(s) required
             rate = factory.flow(item).rateIn
             n, belt = belts_required(rate)
@@ -277,18 +278,18 @@ class LayoutEngine:
         for lane in bus:
             if lane == FREE_LANE:
                 continue
-            lane.route.route(origin.x - lane.route.start.x, 0)
+            lane.route.route(origin.x - lane.route.start.x + 3, 0)
 
         # Finally actually render belts
         origin.render_routes()
 
         # Find bottom power poles and wire together
-        poles = origin.blueprint.find_entities_filtered(name="small-electric-pole")
-        lowest_y = max(p.position.y for p in poles)
-        poles = [p for p in poles if p.position.y == lowest_y]
-        pole_iter = iter(poles[1:])
-        for a, b in zip(pole_iter, pole_iter):
-            origin.blueprint.add_power_connection(a, b)
+        # poles = origin.blueprint.find_entities_filtered(name="small-electric-pole")
+        # lowest_y = max(p.position.y for p in poles)
+        # poles = [p for p in poles if p.position.y == lowest_y]
+        # pole_iter = iter(poles[1:])
+        # for a, b in zip(pole_iter, pole_iter):
+        #     origin.blueprint.add_power_connection(a, b)
 
         took = (time.time() - start) * 100
         logger.info(f"✅ [green]Success[/] (took {took:.1f}ms)")
@@ -325,62 +326,128 @@ class LayoutEngine:
         output_inserter = inserter_required(output_per_machine)
 
         left_belts = 1 if input_belts < 2 else 2
-        right_belts = output_belts if input_belts < 3 else input_belts + output_belts - 2
+        right_belts = output_belts + max(input_belts - 2, 0)
 
         column_width = (
             left_belts + 1 + mul.machine.width + 1 + (3 if right_belts > 1 else 1)
         )  # Add extra space for the 3rd belt tap
-        left = origin[left_belts + 1, -self.vpad + 1]
 
         start_entity_index = len(origin.blueprint.entities)
 
-        input_items = list(mul.inputs)
-        input_inserters = [inserter_required(div(mul.flow(item).rateIn, mul.num)) for item in input_items]
+        # Highest-lowest rate
+        input_items = sorted(mul.inputs, key=lambda item: -mul.flow(item).rateIn)
 
-        # Machines, etc
-        half = mul.num // 2
-        for j in range(mul.num):
-            if mul.num > 1 and j == half:
-                # Make space for right-left balancer.
-                left = left[0, -3]
-                left[1, 0].electric_pole()
+        # Created repeated group for inserter+machine
+        unit = Group()
 
-            left = left[0, -mul.machine.height]
-            left.place(
-                mul.machine.name,
-                N,
-                recipe=mul.machine.recipe.name,
+        # Input inserters
+        for i, input_item in enumerate(input_items):
+            consumed = mul.flow(input_item).rateIn
+            per_machine = div(consumed, mul.num)
+            double_up = False
+            try:
+                inserter_type = inserter_required(per_machine)
+            except InserterLimit:
+                inserter_type = "bulk-inserter"
+                double_up = True
+
+            logger.info(
+                "↠ %s total: %s, per machine: %s",
+                input_item,
+                belt_colour(consumed),
+                inserter_colour(inserter_type, "%.2f/s" % (per_machine,)),
             )
 
-            # Input inserter(s)
-            if input_belts > 1:
-                left[-1, 1].place(input_inserters[1], W)
-                left[-1, 2].long_inserter(W)
-            else:
-                left[-1, 1].place(input_inserters[0], W)
+            x = left_belts if i < left_belts else mul.machine.width + left_belts + 1
+            y = 1 if i == 0 else 2
+            inserter_type = inserter_type if i == 0 else "long-handed-inserter"
+            direction = W if i < 2 else E
+            unit.entities.append(
+                inserter_type,
+                tile_position=(x, y),
+                direction=direction,
+            )
+            if double_up:
+                unit.entities.append(
+                    inserter_type,
+                    tile_position=(x, y + 1),
+                    direction=direction,
+                )
 
-            right = left[mul.machine.width, 0]
-            if input_belts > 2:
-                # Extra input inserter to pull from rightmost input belt
-                right[0, 2].long_inserter(E)
+        # Output inserter
+        unit.entities.append(output_inserter, tile_position=(left_belts + 1 + mul.machine.width, 1), direction=W)
 
-            # Output inserter
-            right[0, 1].place(output_inserter, W)
+        # Machine
+        if mul.machine.type == "assembling-machine":
+            unit.entities.append(
+                mul.machine.name,
+                recipe=mul.machine.recipe.name,
+                tile_position=(left_belts + 1, 0),
+                direction=N,
+            )
+        elif mul.machine.type == "furnace":
+            unit.entities.append(
+                mul.machine.name,
+                tile_position=(left_belts + 1, 0),
+            )
+        else:
+            raise ValueError("Unsupported type: %s" % mul.machine.type)
+
+        # Determine if output load saturates more than half of output belt.
+        left = origin[0, -self.vpad + 1]
+        if mul.num > 1 and belt_load(output_rate, output_belt) > div(1, 2):
+            half = mul.num // 2
+            logger.debug("Output belt requires left-right swap at: %d", half)
+        else:
+            half = None
+
+        # Repeat group up the column
+        for j in range(mul.num):
+            if j == half:
+                # Make space for right-left swap.
+                left = left[0, -3]
+                left[4, 0].electric_pole()
+
+            left = left[0, -mul.machine.height]
+            right = left[left_belts + 1 + mul.machine.width + 1, 0]
 
             # Power poles, every other
             if j % 2 == 0:
-                left[-1, 0].electric_pole()
-                right[0, 0].electric_pole()
+                left[left_belts, 0].electric_pole()
+                right[-1, 0].electric_pole()
+
+            origin.blueprint.groups.append(unit, position=(left.origin.x, left.origin.y))
 
         left = left[0, -mul.machine.height]
         column_height = -(left.origin.y + 2)
 
-        # Inputs
-        right = left_belts + 1 + mul.machine.width + 1
+        self.route_inputs(mul, bus, input_items, left_belts, origin, column_height)
 
+        # Output lane
+        logger.info(
+            "↞ %s: total %s, per machine: %s",
+            output_item,
+            belt_colour(output_rate),
+            inserter_colour(output_inserter, "%.2f/s" % (output_per_machine,)),
+        )
+        self.route_outputs(origin, bus, mul, right[0, 1])
+
+        poles = [e for e in origin.blueprint.entities[start_entity_index:] if e.name == "small-electric-pole"]
+        for a, b in zip(poles, poles[1:]):
+            origin.blueprint.add_power_connection(a, b)
+
+        return column_width
+
+    def route_inputs(self, mul, bus, input_items, left_belts, origin, column_height):
+        # Input lanes
         active_lanes = {i for i, lane in enumerate(bus) if lane.item in mul.inputs}
 
-        for i, input_item in enumerate(input_items):
+        lane_order = input_items
+        if len(lane_order) > 1:
+            # Place highest demand lane on inside left (2nd in)
+            lane_order[0], lane_order[1] = lane_order[1], lane_order[0]
+
+        for i, input_item in enumerate(lane_order):
             # Find lane
             j, lane = next((i, lane) for i, lane in enumerate(bus) if lane.item == input_item)
 
@@ -389,21 +456,12 @@ class LayoutEngine:
             remain = lane.rate - consumed
             fully_consumed = remain == 0
 
-            inserter_type = input_inserters[i]
-            per_machine = div(consumed, mul.num)
-            logger.info(
-                "↠ %s total: %s, per machine: %s",
-                input_item,
-                belt_colour(consumed),
-                inserter_colour(inserter_type, "%.2f/s" % (per_machine,)),
-            )
-
-            x = i if i < left_belts else right + i - 1
+            x = i if i < left_belts else left_belts + 1 + mul.machine.width + 2
             s = origin[x, lane.route.end.y]
             end = origin[x, -column_height + 1]
             if fully_consumed:
                 # Fully consumed - terminate bus lane
-                # logger.info("🫙 Fully consumed: '%s'" % input_item)
+                logger.debug("Fully consumed: '%s'" % input_item)
                 if lane.odd:
                     # Take bus lane straight into input
                     lane.route.route_to(s.origin).route_to(end.origin)
@@ -457,22 +515,7 @@ class LayoutEngine:
             # Update remaining and start
             bus[j] = lane._replace(rate=remain, route=new_bus_route)
 
-        logger.info(
-            "↞ %s: total %s, per machine: %s",
-            output_item,
-            belt_colour(output_rate),
-            inserter_colour(output_inserter, "%.2f/s" % (output_per_machine,)),
-        )
-        # Output(s)
-        self.route_outputs(origin, bus, mul, right, right_belts, column_height)
-
-        poles = [e for e in origin.blueprint.entities[start_entity_index:] if e.name == "small-electric-pole"]
-        for a, b in zip(poles, poles[1:]):
-            origin.blueprint.add_power_connection(a, b)
-
-        return column_width
-
-    def route_outputs(self, origin, bus, mul, right, right_belts, column_height):
+    def route_outputs(self, origin, bus, mul, start):
         # Add output(s) to bus
         # TODO: liquids
         for item in mul.outputs:
@@ -488,11 +531,10 @@ class LayoutEngine:
                 bus.append(FREE_LANE)
 
             # Route output to bus
-            p = origin[right, -column_height + 2]
-            route = p.new_route(rate_out)
-            route.route(0, column_height - 4).route(-2, 0)
+            route = start.new_route(rate_out)
+            route.route_to(Vector(start.origin.x, -2)).route(-2, 0)
 
-            bus_start = origin[right - 2, lane_y(lane_index)].origin
+            bus_start = Vector(start.origin.x - 2, lane_y(lane_index))
             if bus_start.y % 2 == 0:
                 # Odd lanes can be routed straight in
                 route.route_to(bus_start)
@@ -527,9 +569,6 @@ def main():
     config.machinePrefs.set(preset)
     logger.info("Using game config: %s presets: %s", game_mode, preset)
 
-    # rocketFuel = produce([itm.rocket_fuel @ 6], using=[rcp.advanced_oil_processing]).factory
-    # rocketFuel.summary()
-
     assert rcp
 
     rate = frac(150, 60)
@@ -537,9 +576,9 @@ def main():
     logger.info("Target SPM: %s/min (%.1f/s)", rate * 60, float(rate))
     solution = produce(
         [
-            itm.automation_science_pack @ rate,
-            itm.logistic_science_pack @ rate,
-            # itm.military_science_pack @ rate,
+            # itm.automation_science_pack @ rate,
+            # itm.logistic_science_pack @ rate,
+            itm.military_science_pack @ rate,
             # itm.chemical_science_pack @ rate,
             # itm.production_science_pack @ rate,
             # itm.utility_science_pack @ rate,
@@ -562,6 +601,10 @@ def main():
         # using=[rcp.coal_liquefaction],
         roundUp=True,
     )
+    # Military science issues:
+    # brick needs output balance - exceeds 7.5 half belt
+    # piercing rounds 3rd input magazines output bus not freed before trying to reuse for output
+    # various other belt corner issues
     logger.info("🏭 [bold]Factory plan[/b]")
     solution.factory.summary()
     for input in solution.factory.inputs:
@@ -578,6 +621,10 @@ def main():
     bstr = blueprint.to_string()
     pyperclip.copy(bstr)
     logger.info("📋 [blue]Blueprint[/] copied to clipboard (%d bytes)", len(bstr))
+
+    # blueprint = Blueprint.from_string(bstr)
+    # for ent in blueprint.entities:
+    #     print(f"{ent.tile_position} {ent.name}")
 
 
 if __name__ == "__main__":

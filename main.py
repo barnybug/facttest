@@ -397,9 +397,11 @@ class LayoutEngine:
         left = origin[0, -self.vpad + 1]
         if mul.num > 1 and belt_load(output_rate, output_belt) > div(1, 2):
             half = mul.num // 2
+            swap_at = -half * mul.machine.height - self.vpad - 2
             logger.debug("Output belt requires left-right swap at: %d", half)
         else:
             half = None
+            swap_at = None
 
         # Repeat group up the column
         for j in range(mul.num):
@@ -430,7 +432,7 @@ class LayoutEngine:
             belt_colour(output_rate),
             inserter_colour(output_inserter, "%.2f/s" % (output_per_machine,)),
         )
-        self.route_outputs(origin, bus, mul, right[0, 1])
+        self.route_outputs(origin, bus, mul, right[0, 1], swap_at)
 
         poles = [e for e in origin.blueprint.entities[start_entity_index:] if e.name == "small-electric-pole"]
         for a, b in zip(poles, poles[1:]):
@@ -515,7 +517,7 @@ class LayoutEngine:
             # Update remaining and start
             bus[j] = lane._replace(rate=remain, route=new_bus_route)
 
-    def route_outputs(self, origin, bus, mul, start):
+    def route_outputs(self, origin, bus, mul, start, swap_at):
         # Add output(s) to bus
         # TODO: liquids
         for item in mul.outputs:
@@ -532,6 +534,13 @@ class LayoutEngine:
 
             # Route output to bus
             route = start.new_route(rate_out)
+            if swap_at:
+                #  /
+                # ||
+                # \|
+                route.route_to(Vector(start.origin.x, swap_at)).route(-1, 0).route(0, 2).route(1, 0)
+                route = start[0, -start.y + swap_at + 1].new_route(rate_out)
+
             route.route_to(Vector(start.origin.x, -2)).route(-2, 0)
 
             bus_start = Vector(start.origin.x - 2, lane_y(lane_index))
@@ -598,11 +607,9 @@ def main():
             # itm.sulfuric_acid,
             # rcp.solid
         ],
-        # using=[rcp.coal_liquefaction],
         roundUp=True,
     )
     # Military science issues:
-    # brick needs output balance - exceeds 7.5 half belt
     # piercing rounds 3rd input magazines output bus not freed before trying to reuse for output
     # various other belt corner issues
     logger.info("🏭 [bold]Factory plan[/b]")

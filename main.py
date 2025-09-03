@@ -38,7 +38,7 @@ BELT_COLOURS = {
 }
 INSERTER_COLOURS = {
     "inserter": "yellow",
-    "long-hand-inserter": "red",
+    "long-handed-inserter": "red",
     "fast-inserter": "blue",
     "bulk-inserter": "green",
 }
@@ -284,12 +284,12 @@ class LayoutEngine:
         origin.render_routes()
 
         # Find bottom power poles and wire together
-        # poles = origin.blueprint.find_entities_filtered(name="small-electric-pole")
-        # lowest_y = max(p.position.y for p in poles)
-        # poles = [p for p in poles if p.position.y == lowest_y]
-        # pole_iter = iter(poles[1:])
-        # for a, b in zip(pole_iter, pole_iter):
-        #     origin.blueprint.add_power_connection(a, b)
+        poles = origin.blueprint.find_entities_filtered(name="small-electric-pole")
+        lowest_y = max(p.position.y for p in poles)
+        poles = [p for p in poles if p.position.y == lowest_y]
+        pole_iter = iter(poles[1:])
+        for a, b in zip(pole_iter, pole_iter):
+            origin.blueprint.add_power_connection(a, b)
 
         took = (time.time() - start) * 100
         logger.info(f"✅ [green]Success[/] (took {took:.1f}ms)")
@@ -323,14 +323,12 @@ class LayoutEngine:
         output_per_machine = div(output_rate, mul.num)
         n, output_belt = belts_required(output_rate)
         assert n == 1, "Multiple output belts not supported"
-        output_inserter = inserter_required(output_per_machine)
+        output_inserter = inserter_required(output_per_machine) if input_belts < 3 else "long-handed-inserter"
 
         left_belts = 1 if input_belts < 2 else 2
         right_belts = output_belts + max(input_belts - 2, 0)
 
-        column_width = (
-            left_belts + 1 + mul.machine.width + 1 + (3 if right_belts > 1 else 1)
-        )  # Add extra space for the 3rd belt tap
+        column_width = left_belts + 1 + mul.machine.width + 1 + right_belts + 1
 
         start_entity_index = len(origin.blueprint.entities)
 
@@ -360,7 +358,7 @@ class LayoutEngine:
 
             x = left_belts if i < left_belts else mul.machine.width + left_belts + 1
             y = 1 if i == 0 else 2
-            inserter_type = inserter_type if i == 0 else "long-handed-inserter"
+            inserter_type = inserter_type if i != 1 else "long-handed-inserter"
             direction = W if i < 2 else E
             unit.entities.append(
                 inserter_type,
@@ -432,7 +430,8 @@ class LayoutEngine:
             belt_colour(output_rate),
             inserter_colour(output_inserter, "%.2f/s" % (output_per_machine,)),
         )
-        self.route_outputs(origin, bus, mul, right[0, 1], swap_at)
+        output = right[1, 1] if input_belts > 2 else right[0, 1]
+        self.route_outputs(origin, bus, mul, output, swap_at)
 
         poles = [e for e in origin.blueprint.entities[start_entity_index:] if e.name == "small-electric-pole"]
         for a, b in zip(poles, poles[1:]):
@@ -458,9 +457,15 @@ class LayoutEngine:
             remain = lane.rate - consumed
             fully_consumed = remain == 0
 
-            x = i if i < left_belts else left_belts + 1 + mul.machine.width + 2
+            if i < left_belts:
+                x = i
+                end = origin[x, -column_height + 1]
+            else:
+                x = left_belts + 1 + mul.machine.width + 1
+                end = origin[x, -column_height + 1]
             s = origin[x, lane.route.end.y]
-            end = origin[x, -column_height + 1]
+            # end = origin[x, -column_height + 1]
+
             if fully_consumed:
                 # Fully consumed - terminate bus lane
                 logger.debug("Fully consumed: '%s'" % input_item)
@@ -475,47 +480,51 @@ class LayoutEngine:
                     lane.route.route_to(s[1, 0].origin).route(0, 2).route(-1, 0).route_to(end.origin)
                 # Free up slot
                 bus[j] = FREE_LANE
-                continue
-
-            # Bus tap
-            if lane.odd:
-                #   >/
-                #  ->+
-                s.splitter(lane.route.belt, (-1, -1), E)
-                # Route lane into splitter
-                lane.route.route_to(s[-1, 0].origin)
-                # And top output of splitter to input
-                top_output = s[0, -1].new_route(consumed)
-                top_output.route_to(end.origin)
             else:
-                #  +>-
-                #  ^>\
-                #  \-/
-                # Special case - if the next odd lane is being tapped too, it'd clash.
-                if j + 1 in active_lanes:
-                    # .>/,
-                    #  >+
+                # Bus tap
+                if lane.odd:
+                    #   >/
+                    #  ->+
                     s.splitter(lane.route.belt, (-1, -1), E)
                     # Route lane into splitter
                     lane.route.route_to(s[-1, 0].origin)
                     # And top output of splitter to input
-                    s[0, -1].place(belt_required(consumed), N)  # yuck
-                    top_output = s[0, -2].new_route(consumed)
+                    top_output = s[0, -1].new_route(consumed)
                     top_output.route_to(end.origin)
                 else:
-                    s.splitter(lane.route.belt, (1, 0), E)
-                    # Route lane into splitter
-                    lane.route.route_to(s[1, 0].origin)
-                    # And top output of splitter to input
-                    top_output = s[2, 1].new_route(consumed)
-                    top_output.route(0, 1).route(-2, 0).route_to(end.origin)
-                    # Move continuation point to splitter out
-                    s = s[2, 0]
+                    #  +>-
+                    #  ^>\
+                    #  \-/
+                    # Special case - if the next odd lane is being tapped too, it'd clash.
+                    if j + 1 in active_lanes:
+                        # .>/,
+                        #  >+
+                        s.splitter(lane.route.belt, (-1, -1), E)
+                        # Route lane into splitter
+                        lane.route.route_to(s[-1, 0].origin)
+                        # And top output of splitter to input
+                        s[0, -1].place(belt_required(consumed), N)  # yuck
+                        top_output = s[0, -2].new_route(consumed)
+                        top_output.route_to(end.origin)
+                    else:
+                        s.splitter(lane.route.belt, (1, 0), E)
+                        # Route lane into splitter
+                        lane.route.route_to(s[1, 0].origin)
+                        # And top output of splitter to input
+                        top_output = s[2, 1].new_route(consumed)
+                        top_output.route(0, 1).route(-2, 0).route_to(end.origin)
+                        # Move continuation point to splitter out
+                        s = s[2, 0]
 
-            # Bottom output of splitter
-            new_bus_route = s.new_route(remain)
-            # Update remaining and start
-            bus[j] = lane._replace(rate=remain, route=new_bus_route)
+                # Bottom output of splitter
+                new_bus_route = s.new_route(remain)
+                # Update remaining and start
+                bus[j] = lane._replace(rate=remain, route=new_bus_route)
+
+            if i >= left_belts:
+                # 'swan neck'
+                # lane.route.route(2, 0).route_to(x, -column_height + 1)
+                pass
 
     def route_outputs(self, origin, bus, mul, start, swap_at):
         # Add output(s) to bus
@@ -541,9 +550,9 @@ class LayoutEngine:
                 route.route_to(Vector(start.origin.x, swap_at)).route(-1, 0).route(0, 2).route(1, 0)
                 route = start[0, -start.y + swap_at + 1].new_route(rate_out)
 
-            route.route_to(Vector(start.origin.x, -2)).route(-2, 0)
+            # route.route_to(Vector(start.origin.x, -2)).route(-2, 0)
 
-            bus_start = Vector(start.origin.x - 2, lane_y(lane_index))
+            bus_start = Vector(start.origin.x, lane_y(lane_index))
             if bus_start.y % 2 == 0:
                 # Odd lanes can be routed straight in
                 route.route_to(bus_start)
@@ -585,8 +594,8 @@ def main():
     logger.info("Target SPM: %s/min (%.1f/s)", rate * 60, float(rate))
     solution = produce(
         [
-            # itm.automation_science_pack @ rate,
-            # itm.logistic_science_pack @ rate,
+            itm.automation_science_pack @ rate,
+            itm.logistic_science_pack @ rate,
             itm.military_science_pack @ rate,
             # itm.chemical_science_pack @ rate,
             # itm.production_science_pack @ rate,
@@ -609,9 +618,6 @@ def main():
         ],
         roundUp=True,
     )
-    # Military science issues:
-    # piercing rounds 3rd input magazines output bus not freed before trying to reuse for output
-    # various other belt corner issues
     logger.info("🏭 [bold]Factory plan[/b]")
     solution.factory.summary()
     for input in solution.factory.inputs:
